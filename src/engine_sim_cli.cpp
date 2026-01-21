@@ -142,26 +142,56 @@ public:
             int16Data[i] = static_cast<int16_t>(sample * 32767.0f);
         }
 
-        ALuint buffer = buffers[currentBuffer];
-        alBufferData(buffer, AL_FORMAT_STEREO16, int16Data.data(), frames * 2 * sizeof(int16_t), sampleRate);
-
+        // Check how many buffers have been processed
         ALint processed;
         alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
 
-        if (processed > 0) {
+        // Unqueue processed buffers
+        while (processed > 0) {
             ALuint buf;
             alSourceUnqueueBuffers(source, 1, &buf);
+            processed--;
         }
 
-        alSourceQueueBuffers(source, 1, &buffer);
+        // Check how many buffers are currently queued
+        ALint queued;
+        alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
 
+        // Only queue new buffer if we have space (max 2 buffers)
+        if (queued < 2) {
+            ALuint buffer = buffers[currentBuffer];
+            alBufferData(buffer, AL_FORMAT_STEREO16, int16Data.data(), frames * 2 * sizeof(int16_t), sampleRate);
+
+            ALenum error = alGetError();
+            if (error != AL_NO_ERROR) {
+                std::cerr << "OpenAL Error buffering data: " << error << "\n";
+                return false;
+            }
+
+            alSourceQueueBuffers(source, 1, &buffer);
+
+            error = alGetError();
+            if (error != AL_NO_ERROR) {
+                std::cerr << "OpenAL Error queuing buffers: " << error << "\n";
+                return false;
+            }
+
+            currentBuffer = (currentBuffer + 1) % 2;
+        }
+
+        // Start playback if not already playing
         ALint state;
         alGetSourcei(source, AL_SOURCE_STATE, &state);
         if (state != AL_PLAYING) {
             alSourcePlay(source);
+
+            ALenum error = alGetError();
+            if (error != AL_NO_ERROR) {
+                std::cerr << "OpenAL Error starting playback: " << error << "\n";
+                return false;
+            }
         }
 
-        currentBuffer = (currentBuffer + 1) % 2;
         return true;
     }
 
@@ -562,7 +592,11 @@ int runSimulation(const CommandLineArgs& args) {
     }
 
     // Setup recording buffer
-    const int totalFrames = static_cast<int>(args.duration * sampleRate);
+    // In interactive mode without output, we only need a small buffer for real-time playback
+    // In non-interactive mode or with output file, we need the full duration buffer
+    const int totalFrames = (args.interactive && !args.outputWav) ?
+        (sampleRate / 60) :  // Single update buffer for interactive-only mode
+        (static_cast<int>(args.duration * sampleRate));
     const int totalSamples = totalFrames * channels;
     std::vector<float> audioBuffer(totalSamples);
 
@@ -587,6 +621,14 @@ int runSimulation(const CommandLineArgs& args) {
     if (args.interactive) {
         keyboardInput = new KeyboardInput();
         std::cout << "\nInteractive mode enabled. Press Q to quit.\n\n";
+        std::cout << "Interactive Controls:\n";
+        std::cout << "  A - Toggle ignition\n";
+        std::cout << "  S - Toggle starter motor\n";
+        std::cout << "  W - Increase target RPM\n";
+        std::cout << "  SPACE - Brake\n";
+        std::cout << "  R - Reset to idle\n";
+        std::cout << "  J/K or Down/Up - Decrease/Increase load\n";
+        std::cout << "  Q/ESC - Quit\n\n";
     }
 
     // Main simulation loop
@@ -642,7 +684,7 @@ int runSimulation(const CommandLineArgs& args) {
 
     currentTime = 0.0;
 
-    while (currentTime < args.duration && framesRendered < totalFrames && g_running.load()) {
+    while ((!args.interactive && currentTime < args.duration && framesRendered < totalFrames) || (args.interactive && g_running.load())) {
         // Get current stats
         EngineSimStats stats = {};
         EngineSimGetStats(handle, &stats);
@@ -670,8 +712,15 @@ int runSimulation(const CommandLineArgs& args) {
 
         // Handle keyboard input in interactive mode
         if (args.interactive && keyboardInput) {
+            // Track previous key to detect repeat vs new press
+            static int lastKey = -1;
             int key = keyboardInput->getKey();
-            if (key > 0) {
+
+            // Reset key state when no key is pressed (key is released)
+            if (key < 0) {
+                lastKey = -1;
+            } else if (key != lastKey) {
+                // Only process if this is a new key press (not a repeat)
                 switch (key) {
                     case 27:  // ESC
                     case 'q':
@@ -683,8 +732,6 @@ int runSimulation(const CommandLineArgs& args) {
                         interactiveTargetRPM += 100;
                         rpmController.setTargetRPM(interactiveTargetRPM);
                         break;
-                    // S key now controls starter motor toggle
-                    break;
                     case ' ':
                         // Brake
                         interactiveLoad = 0.0;
@@ -696,30 +743,42 @@ int runSimulation(const CommandLineArgs& args) {
                         interactiveLoad = 0.2;
                         rpmController.setTargetRPM(interactiveTargetRPM);
                         break;
+                    case 'a':
+                        // Toggle ignition module - only on initial press, not repeat
+                        // Note: 'A' (65) conflicts with UP arrow on macOS, so we handle it separately
+                        {
+                            static bool ignitionState = false;
+                            ignitionState = !ignitionState;
+                            EngineSimSetIgnition(handle, ignitionState ? 1 : 0);
+                            std::cout << "Ignition " << (ignitionState ? "enabled" : "disabled") << "\n";
+                        }
+                        break;
                     case 's':
                     case 'S':
-                        // Toggle starter motor
-                        static bool starterState = false;
-                        starterState = !starterState;
-                        EngineSimSetStarterMotor(handle, starterState ? 1 : 0);
-                        std::cout << "Starter motor " << (starterState ? "enabled" : "disabled") << "\n";
+                        // Toggle starter motor - only on initial press, not repeat
+                        {
+                            static bool starterState = false;
+                            starterState = !starterState;
+                            EngineSimSetStarterMotor(handle, starterState ? 1 : 0);
+                            std::cout << "Starter motor " << (starterState ? "enabled" : "disabled") << "\n";
+                        }
                         break;
-                    case 'a':  // Lowercase 'a' only (uppercase 'A' conflicts with UP arrow code 65)
-                        // Toggle ignition module
-                        static bool ignitionState = false;
-                        ignitionState = !ignitionState;
-                        EngineSimSetIgnition(handle, ignitionState ? 1 : 0);
-                        std::cout << "Ignition " << (ignitionState ? "enabled" : "disabled") << "\n";
-                        break;
-                    case 65:  // UP arrow (macOS)
-                    case 'k':  // Alternative UP key
+                    case 65:  // UP arrow (macOS) - also 'A' which we want to avoid
                         interactiveLoad = std::min(1.0, interactiveLoad + 0.05);
                         break;
                     case 66:  // DOWN arrow (macOS)
+                        interactiveLoad = std::max(0.0, interactiveLoad - 0.05);
+                        break;
+                    case 'k':  // Alternative UP key
+                    case 'K':
+                        interactiveLoad = std::min(1.0, interactiveLoad + 0.05);
+                        break;
                     case 'j':  // Alternative DOWN key
+                    case 'J':
                         interactiveLoad = std::max(0.0, interactiveLoad - 0.05);
                         break;
                 }
+                lastKey = key;
             }
 
             // In interactive mode, use RPM control if target is set
@@ -756,26 +815,34 @@ int runSimulation(const CommandLineArgs& args) {
         EngineSimUpdate(handle, updateInterval);
 
         // Render audio
-        const int framesToRender = std::min(framesPerUpdate, totalFrames - framesRendered);
+        int framesToRender = framesPerUpdate;
+
+        // In non-interactive mode, check buffer limits
+        if (!args.interactive) {
+            framesToRender = std::min(framesPerUpdate, totalFrames - framesRendered);
+        }
+
         if (framesToRender > 0) {
             int samplesWritten = 0;
-            result = EngineSimRender(
-                handle,
-                audioBuffer.data() + framesRendered * channels,
-                framesToRender,
-                &samplesWritten
-            );
+            float* writePtr = audioBuffer.data();
+
+            // For interactive mode without output, always write to start of buffer
+            // For non-interactive mode or with output, append to buffer
+            if (!args.interactive || args.outputWav) {
+                writePtr = audioBuffer.data() + framesRendered * channels;
+            }
+
+            result = EngineSimRender(handle, writePtr, framesToRender, &samplesWritten);
 
             if (result == ESIM_SUCCESS && samplesWritten > 0) {
-                framesRendered += samplesWritten;
+                // Only track frames if we're saving to file or in non-interactive mode
+                if (!args.interactive || args.outputWav) {
+                    framesRendered += samplesWritten;
+                }
 
                 // Play audio in real-time
                 if (audioPlayer) {
-                    audioPlayer->playBuffer(
-                        audioBuffer.data() + (framesRendered - samplesWritten) * channels,
-                        samplesWritten,
-                        sampleRate
-                    );
+                    audioPlayer->playBuffer(writePtr, samplesWritten, sampleRate);
                 }
             }
         }
@@ -862,7 +929,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Configuration:\n";
     std::cout << "  Engine: " << args.engineConfig << "\n";
     std::cout << "  Output: " << (args.outputWav ? args.outputWav : "(none - audio not saved)") << "\n";
-    std::cout << "  Duration: " << args.duration << " seconds\n";
+    if (args.interactive) {
+        std::cout << "  Duration: (interactive - runs until quit)\n";
+    } else {
+        std::cout << "  Duration: " << args.duration << " seconds\n";
+    }
     if (args.targetRPM > 0) {
         std::cout << "  Target RPM: " << args.targetRPM << "\n";
     }
