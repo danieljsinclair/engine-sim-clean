@@ -9,9 +9,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(OpenAL REQUIRED)
 find_package(Threads REQUIRED)
 
-# Use local engine-sim for development
-# Comment this out and use FetchContent for release builds
-set(ENGINE_SIM_LOCAL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../engine-sim" CACHE PATH "Path to local engine-sim")
+# Use engine-sim submodule (or local path for development)
+set(ENGINE_SIM_LOCAL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/engine-sim" CACHE PATH "Path to local engine-sim")
 
 if(EXISTS "${ENGINE_SIM_LOCAL_PATH}/CMakeLists.txt")
     # Disable building GUI app
